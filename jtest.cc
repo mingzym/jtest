@@ -59,24 +59,6 @@ typedef int64_t ink_hrtime;
 
 #define SIZE(x) (sizeof(x)/sizeof((x)[0]))
 
-/*
- FTP - Traffic Server Template
-   220 i5 FTP server (Version wu-2.4(3) Mon Jul 8 14:39:48 PDT 1996) ready.
-   USER anonymous
-   331 Guest login ok, send your complete e-mail address as password.
-   PASS traffic_server@inktomi.com
-   230 Guest login ok, access restrictions apply.
-   CWD .
-   250 CWD command successful.
-   TYPE I
-   200 Type set to I.
-   PASV
-   227 Entering Passive Mode (128,174,5,14,16,238)
-   RETR foo
-   LIST
-   150 Opening ASCII mode data connection for /bin/ls.
-*/
-
 #define MAX_URL_LEN 1024
 
 //
@@ -107,19 +89,12 @@ typedef int64_t ink_hrtime;
 #define MAX_RESPONSE_LENGTH   1000000
 #define HEADER_SIZE           10000
 #define POLL_TIMEOUT          10
-#define STATE_FTP_DATA_READY  0xFAD
 #define MAX_DEFERED_URLS      10000
 #define DEFERED_URLS_BLOCK    2000
 
 static const char * hexdigits = "0123456789ABCDEFabcdef";
 static const char * dontunescapify = "#;/?+=&:@%";
 static const char * dontescapify = "#;/?+=&:@~.-_%";
-
-enum FTP_MODE {
-  FTP_NULL,
-  FTP_PORT,
-  FTP_PASV
-};
 
 typedef int (*accept_fn_t)(int);
 typedef int (*poll_cb)(int);
@@ -137,13 +112,11 @@ static int make_client (unsigned int addr, int port);
 static void make_bfc_client (unsigned int addr, int port);
 static int make_url_client(const char * url,const char * base_url = 0, bool seen = false,
                            bool unthrottled = false);
-static int write_ftp_response(int sock);
 static void interval_report();
 static void undefer_url(bool unthrottled = false);
 static void done();
 static int is_done();
 static int open_server(unsigned short int port, accept_fn_t accept_fn);
-static int accept_ftp_data (int sock);
 
 char ** defered_urls = NULL; 
 int n_defered_urls = 0;
@@ -203,11 +176,6 @@ int version = 0;
 int urls_mode = 0;
 int pipeline = 1;
 int hostrequest = 0;
-int ftp = 0;
-double ftp_mdtm_err_rate = 0.0;
-int ftp_mdtm_rate = 0;
-time_t ftp_mdtm_last_update = 0;
-char ftp_mdtm_str[64];
 int embed_url = 1;
 double ims_rate = 0.5;
 double client_abort_rate = 0.0;
@@ -295,11 +263,6 @@ ArgumentDescription argument_descriptions[] = {
    "JTEST_SHOW_URLS",NULL},
   {"show_headers", 'X', "Show Headers","F", &show_headers,      
    "JTEST_SHOW_HEADERS",NULL},
-  {"ftp",'f',"FTP Requests","F",&ftp, "JTEST_FTP",NULL},
-  {"ftp_mdtm_err_rate", ' ', "FTP MDTM 550 Error Rate", "D",
-   &ftp_mdtm_err_rate, "JTEST_FTP_MDTM_ERR_RATE", NULL},
-  {"ftp_mdtm_rate", ' ', "FTP MDTM Update Rate (sec, 0:never)", "I",
-   &ftp_mdtm_rate, "JTEST_FTP_MDTM_RATE", NULL},
   {"fullpage",'l',"Full Page (Images)","F",&fullpage, 
    "JTEST_FULLPAGE",NULL},
   {"follow",'F',"Follow Links","F",&follow_arg, "JTEST_FOLLOW",NULL},
@@ -407,10 +370,6 @@ struct FD {
   unsigned int jg_compressed:1;
   int * count;
   int bytes;
-  int ftp_data_fd;
-  FTP_MODE ftp_mode;
-  unsigned int ftp_peer_addr;
-  unsigned short ftp_peer_port;
 
   void reset() {
     next = 0;
@@ -436,15 +395,12 @@ struct FD {
     drop_after_CL = ::drop_after_CL;
     client_abort = 0;
     jg_compressed = 0;
-    ftp_mode = FTP_NULL;
-    ftp_peer_addr = 0;
-    ftp_peer_port = 0;
   }
   
   void close();
   FD() { 
     req_header = 0; base_url = 0; keepalive = 0; 
-    response_header = 0; ftp_data_fd = 0; 
+    response_header = 0;
     reset(); 
   }
 };
@@ -464,7 +420,6 @@ void FD::close() {
     current_clients--;
   reset();
   if (urls_mode) undefer_url();
-  ftp_data_fd = 0;
 }
 
 // Library functions from libts
@@ -1809,43 +1764,37 @@ static int send_response (int sock)
         content_type = "image/jpeg";
       }
     }
-    if (!ftp && embed_url && fd[sock].response_length > 16) {
+    if (embed_url && fd[sock].response_length > 16) {
       get_path_from_req(fd[sock].req_header, &url_start, &url_end);
       *url_end = 0;
       url_len = url_end - url_start;
     }
     int print_len = 0;
-    if (!ftp) {
-      if (fd[sock].ims) {
-        print_len = sprintf(
-          header,"HTTP/1.0 304 Not-Modified\r\n"
-          "Content-Type: %s\r\n"
-          "Last-Modified: Mon, 05 Oct 2010 01:00:00 GMT\r\n"
-          "%s"
-          "\r\n",
-          content_type,
-          fd[sock].keepalive>0?"Connection: Keep-Alive\r\n":"");
-        url_len = 0;
-      } else
-        print_len = sprintf(
-          header,"HTTP/1.0 200 OK\r\n"
-          "Content-Type: %s\r\n"
-          "Cache-Control: max-age=630720000\r\n"
-          "Last-Modified: Mon, 05 Oct 2010 01:00:00 GMT\r\n"
-          "%s"
-          "Content-Length: %d\r\n"
-          "%s"
-          "\r\n%s",
-          content_type,
-          fd[sock].keepalive>0?"Connection: Keep-Alive\r\n":"",
-          fd[sock].response_length,
-          no_cache?"Pragma: no-cache\r\nCache-Control: no-cache\r\n":"",
-          url_start ? url_start : "");
+    if (fd[sock].ims) {
+      print_len = sprintf(
+        header,"HTTP/1.0 304 Not-Modified\r\n"
+        "Content-Type: %s\r\n"
+        "Last-Modified: Mon, 05 Oct 2010 01:00:00 GMT\r\n"
+        "%s"
+        "\r\n",
+        content_type,
+        fd[sock].keepalive>0?"Connection: Keep-Alive\r\n":"");
+      url_len = 0;
     } else
-      url_len = print_len = 
-        sprintf(header, "ftp://%s:%d/%12.10f/%d", 
-                local_host, server_port,
-                fd[sock].doc, fd[sock].length);
+      print_len = sprintf(
+        header,"HTTP/1.0 200 OK\r\n"
+        "Content-Type: %s\r\n"
+        "Cache-Control: max-age=630720000\r\n"
+        "Last-Modified: Mon, 05 Oct 2010 01:00:00 GMT\r\n"
+        "%s"
+        "Content-Length: %d\r\n"
+        "%s"
+        "\r\n%s",
+        content_type,
+        fd[sock].keepalive>0?"Connection: Keep-Alive\r\n":"",
+        fd[sock].response_length,
+        no_cache?"Pragma: no-cache\r\nCache-Control: no-cache\r\n":"",
+        url_start ? url_start : "");
     if (show_headers) printf("Response to Proxy: {\n%s}\n", header);
     int len = print_len - fd[sock].req_pos;
     ink_assert(len>0);
@@ -1902,7 +1851,7 @@ static int send_response (int sock)
     if (fd[sock].response) 
       new_sops++;
     if (verbose) printf("write %d done\n", sock);
-    if (fd[sock].keepalive > 0 && !ftp) {
+    if (fd[sock].keepalive > 0) {
       poll_init_set(sock, read_request);
       fd[sock].start = now;
       fd[sock].ready = now + server_delay * HRTIME_MSECOND;
@@ -1965,42 +1914,6 @@ static int check_alt(char * r, int length) {
       return 0;
     return ink_atoi(s + 1);
   }
-  return 0;
-}
-
-static void make_response(int sock, int code) {
-  fd[sock].response = fd[sock].req_header;
-  fd[sock].length = sprintf( fd[sock].req_header, "%d\r\n", code);
-  fd[sock].req_pos = 0;
-  fd[sock].response_length = strlen(fd[sock].req_header);
-  poll_set(sock, NULL, write_ftp_response);
-}
-
-static void make_long_response(int sock) {
-  fd[sock].response = fd[sock].req_header;
-  fd[sock].req_pos = 0;
-  fd[sock].response_length = strlen(fd[sock].req_header);
-  poll_set(sock, NULL, write_ftp_response);
-}
-
-static int send_ftp_data_when_ready(int sock) {
-  if (fd[sock].state == STATE_FTP_DATA_READY && fd[sock].doc_length) {
-    fd[sock].response = fd[sock].req_header;
-    fd[sock].response_length = fd[sock].length = fd[sock].doc_length;
-    if (verbose) printf("ftp data %d >-< %d\n", sock, fd[sock].ftp_data_fd);
-    fd[sock].response = response_buffer + fd[sock].doc_length % 256;
-    fd[sock].req_pos = 0;
-    poll_set(sock, NULL, send_response);
-  }
-  return 0;
-}
-
-static int send_ftp_data(int sock, char * start /*, char * end */) {
-  int data_fd = fd[sock].ftp_data_fd;
-  if (sscanf(start,"%d",&fd[data_fd].doc_length) != 1)
-    return -1;
-  fd[data_fd].doc = fd[sock].doc;
-  send_ftp_data_when_ready(data_fd);
   return 0;
 }
 
@@ -2247,181 +2160,6 @@ Lcont:
   return 0;
 }
 
-static int read_ftp_request(int sock) {
-  if (verbose) printf("read_ftp_request %d\n", sock);
-  int err = 0;
-  int i;
-
-  int maxleft = HEADER_SIZE - fd[sock].req_pos - 1;
-
-  do {
-    err = read (sock, &fd[sock].req_header[fd[sock].req_pos], 
-                maxleft);
-  } while ((err < 0) && (errno == EINTR));
-  
-  if (err < 0) {
-    if (errno == EAGAIN || errno == ENOTCONN) return 0;
-    perror ("read");
-    return -1;
-  } else if (err == 0) {
-    if (verbose) printf("eof\n");
-    return -1;
-  } else {
-    if (verbose) printf("read %d got %d\n", sock, err);
-    new_tbytes += err;
-    fd[sock].req_pos += err;
-    fd[sock].req_header[fd[sock].req_pos] = 0;
-    char *buffer = fd[sock].req_header, *n;
-    int res = 0;
-    buffer[fd[sock].req_pos] = 0;
-    if (verbose) printf("buffer [%s]\n", buffer);
-#define STREQ(_x,_s) (!strncasecmp(_x,_s,sizeof(_s)-1))
-    if (STREQ(buffer,"USER")) {
-        res = 331; goto Lhere;
-    } else if (STREQ(buffer,"PASS")) {
-        res = 230; goto Lhere;
-    } else if (STREQ(buffer,"CWD")) {
-      // TS used to send "CWD 1.2110000000..."
-      // TS now sends "CWD /1.2110000000^M\n", so skip 5 instead of 4
-      fd[sock].doc = (buffer[4]=='/') ? atof(buffer + 5) : atof(buffer + 4);
-      res = 250; goto Lhere;
-    } else if (STREQ(buffer,"TYPE")) {
-        res = 200;
-    Lhere:
-        n = (char*)memchr(buffer,'\n',fd[sock].req_pos);
-        if (!n) return 0;
-        make_response(sock,res);
-        return 0;
-    } else if (STREQ(buffer,"SIZE")) {
-        fd[sock].length = 
-          sprintf(fd[sock].req_header, "213 %d\r\n", atoi(buffer + 5));
-        make_long_response(sock);
-        return 0;
-    } else if (STREQ(buffer,"MDTM")) {
-      double err_rand = 1.0;
-      if (ftp_mdtm_err_rate != 0.0) err_rand = drand48();
-      if (err_rand < ftp_mdtm_err_rate) {
-        fd[sock].length =
-          sprintf (fd[sock].req_header, "550 mdtm file not found\r\n");
-      } else {
-        if (ftp_mdtm_rate == 0) {
-          fd[sock].length =
-            sprintf (fd[sock].req_header, "213 19900615100045\r\n");
-        } else {
-          time_t mdtm_now;
-          time(&mdtm_now);
-          if (mdtm_now-ftp_mdtm_last_update > ftp_mdtm_rate) {
-            struct tm *mdtm_tm;
-            ftp_mdtm_last_update = mdtm_now;
-            mdtm_tm = localtime(&ftp_mdtm_last_update);
-            sprintf(ftp_mdtm_str, "213 %.4d%.2d%.2d%.2d%.2d%.2d",
-                    mdtm_tm->tm_year + 1900,
-                    mdtm_tm->tm_mon + 1,
-                    mdtm_tm->tm_mday,
-                    mdtm_tm->tm_hour,
-                    mdtm_tm->tm_min,
-                    mdtm_tm->tm_sec);
-          }
-          fd[sock].length =
-            sprintf (fd[sock].req_header, "%s\r\n", ftp_mdtm_str);
-        }
-      }
-      make_long_response(sock);
-      return 0;
-    } else if (STREQ(buffer,"PASV")) {
-        n = (char*)memchr(buffer,'\n',fd[sock].req_pos);
-        if (!n) return 0;
-        if ((fd[sock].ftp_data_fd = open_server(0, accept_ftp_data)) < 0)
-          panic("could not open ftp data PASV accept port\n");
-        fd[fd[sock].ftp_data_fd].ftp_data_fd = sock;
-        if (verbose) printf("ftp PASV %d <-> %d\n", sock,fd[sock].ftp_data_fd);
-        unsigned short p = fd[fd[sock].ftp_data_fd].name.sin_port;
-        fd[sock].length = 
-          sprintf(fd[sock].req_header, "227 (%u,%u,%u,%u,%u,%u)\r\n",
-                  ((unsigned char*)&local_addr)[0],
-                  ((unsigned char*)&local_addr)[1],
-                  ((unsigned char*)&local_addr)[2],
-                  ((unsigned char*)&local_addr)[3],
-                  ((unsigned char*)&p)[0],
-                  ((unsigned char*)&p)[1]);
-        if (verbose) puts(fd[sock].req_header);
-        make_long_response(sock);
-        fd[sock].ftp_mode = FTP_PASV;
-        return 0;
-    } else if (STREQ(buffer,"PORT")) {
-        // watch out for an endian problems !!!
-        char *start, *stop;
-        for (start = buffer; !ParseRules::is_digit(*start); start++);
-        for (stop = start; *stop != ','; stop++);
-        for (i = 0; i < 4; i++) {
-          ((unsigned char*)&(fd[sock].ftp_peer_addr))[i] =
-            strtol(start, &stop, 10);
-          for (start = ++stop; *stop != ','; stop++);
-        }
-        ((unsigned char*)&(fd[sock].ftp_peer_port))[0] =
-          strtol(start, &stop, 10);
-        start = ++stop;
-        ((unsigned char*)&(fd[sock].ftp_peer_port))[1] =
-          strtol(start, NULL, 10);
-        fd[sock].length = 
-          sprintf(fd[sock].req_header, "200 Okay\r\n");
-        if (verbose) puts(fd[sock].req_header);
-        make_long_response(sock);
-        fd[sock].ftp_mode = FTP_PORT;
-        return 0;
-    } else if (STREQ(buffer,"RETR")) {
-        if (fd[sock].ftp_mode == FTP_NULL) {
-          // default to PORT ftp
-          struct sockaddr_in ftp_peer;
-          int ftp_peer_addr_len = sizeof(ftp_peer);
-          if (getpeername(sock, (struct sockaddr*)&ftp_peer,
-#if 0
-                          &ftp_peer_addr_len
-#else
-                          (socklen_t*)&ftp_peer_addr_len
-#endif
-            ) < 0) {
-            perror("getsockname");
-            exit(EXIT_FAILURE);
-          }
-          fd[sock].ftp_peer_addr = ftp_peer.sin_addr.s_addr;
-          fd[sock].ftp_peer_port = ftp_peer.sin_port;
-          fd[sock].ftp_mode = FTP_PORT;
-        }
-        if (fd[sock].ftp_mode == FTP_PORT) {
-          if ((fd[sock].ftp_data_fd =
-               make_client(fd[sock].ftp_peer_addr,fd[sock].ftp_peer_port)) < 0)
-            panic("could not open ftp PORT data connection to client\n");
-          fd[fd[sock].ftp_data_fd].ftp_data_fd = sock;
-          fd[fd[sock].ftp_data_fd].state = STATE_FTP_DATA_READY;
-          if (verbose)
-            printf("ftp PORT %d <-> %d\n", sock, fd[sock].ftp_data_fd);
-        }
-        n = (char*)memchr(buffer,'\n',fd[sock].req_pos);
-        if (!n) return 0;
-        if (send_ftp_data(sock, buffer+5 /*, n */)<0) {
-          errors++;
-          *n = 0;
-          if (verbose)
-            printf("badly formed ftp request: %s\n", buffer);
-          return 1;
-        }
-        fd[sock].response = fd[sock].req_header;
-        fd[sock].length = sprintf( fd[sock].req_header, "150 %d bytes\r\n", 
-                                   fd[fd[sock].ftp_data_fd].length);
-        fd[sock].req_pos = 0;
-        fd[sock].response_length = strlen(fd[sock].req_header);
-        poll_set(sock, NULL, write_ftp_response);
-        buffer = n+1;
-        return 0;
-    } else {
-      if (verbose || verbose_errors) printf("ftp junk : %s\n", buffer);
-      fd[sock].req_pos = 0;
-      return 0;
-    }
-  }
-}
-
 static int accept_sock(int sock) {
   struct sockaddr_in clientname;
   int size = sizeof (clientname);
@@ -2489,38 +2227,13 @@ static int accept_read (int sock) {
   int new_fd = accept_sock(sock);
   servers++;
   new_servers++;
-  if (ftp) {
-    poll_init_set(new_fd, NULL, write_ftp_response);
-    make_response(new_fd, 220);
-  } else
-    poll_init_set(new_fd, read_request);
+  poll_init_set(new_fd, read_request);
   fd[new_fd].count = &servers;
   fd[new_fd].start = now;
   fd[new_fd].ready = now + server_delay * HRTIME_MSECOND;
   fd[new_fd].keepalive = server_keepalive?server_keepalive:INT_MAX;
 
   return 0;
-}
-
-static int accept_ftp_data (int sock) {
-  int new_fd = accept_sock(sock);
-  servers++;
-  new_servers++;
-  poll_init(new_fd);
-  fd[new_fd].ftp_data_fd = fd[sock].ftp_data_fd;
-  fd[fd[sock].ftp_data_fd].ftp_data_fd = new_fd;
-  fd[new_fd].state = STATE_FTP_DATA_READY;
-  fd[new_fd].count = &servers;
-  fd[new_fd].start = now;
-  fd[new_fd].ready = now + server_delay * HRTIME_MSECOND;
-  fd[new_fd].keepalive = server_keepalive?server_keepalive:INT_MAX;
-  fd[new_fd].state = STATE_FTP_DATA_READY;
-  fd[new_fd].doc = fd[sock].doc;
-  fd[new_fd].doc_length = fd[sock].doc_length;
-  if (verbose) 
-    printf("accept_ftp_data %d for %d\n", new_fd, sock);
-  send_ftp_data_when_ready(new_fd);
-  return 1;
 }
 
 static int open_server(unsigned short int port, accept_fn_t accept_fn) {
@@ -3376,40 +3089,6 @@ Lerror:
 #endif
 }
 
-static int write_ftp_response(int sock) {
-  int err = 0;
-  
-  do {
-    err = write(sock, fd[sock].req_header + fd[sock].req_pos, 
-                fd[sock].length - fd[sock].req_pos);
-  } while ((err == -1) && (errno == EINTR));
-  
-  if (err <= 0) {
-    if (!err) {
-      if (verbose_errors) printf("write %d closed early\n", sock);
-      goto Lerror;
-    }
-    if (errno == EAGAIN || errno == ENOTCONN) return 0;
-    perror("write");
-    goto Lerror;
-  }
-  if (verbose) printf("write %d %d\n", sock, err);
-
-  new_tbytes += err;
-  fd[sock].req_pos += err;
-  
-  if (fd[sock].req_pos >= fd[sock].length) {
-    if (verbose) printf("write complete %d %d\n", sock, fd[sock].length);
-    fd[sock].req_pos = 0;
-    fd[sock].length = fd[sock].response_length;
-    poll_set(sock, read_ftp_request);
-  }
-  return 0;
-Lerror:
-  errors++;
-  return 1;
-}
-
 static int make_client (unsigned int addr, int port) {
   struct linger lngr;
 
@@ -3439,12 +3118,10 @@ static int make_client (unsigned int addr, int port) {
   /* Tell the socket not to linger on exit */
   lngr.l_onoff = 1;
   lngr.l_linger = 0;
-  if (!ftp) {  // this causes problems for PORT ftp -- ewong
-    if (setsockopt (sock, SOL_SOCKET, SO_LINGER, (char*) &lngr, 
-                    sizeof (struct linger)) < 0) {
-      perror ("setsockopt");
-      exit (EXIT_FAILURE);
-    }
+  if (setsockopt (sock, SOL_SOCKET, SO_LINGER, (char*) &lngr,
+                  sizeof (struct linger)) < 0) {
+    perror ("setsockopt");
+    exit (EXIT_FAILURE);
   }
 
   /* Give the socket a name. */
@@ -3551,14 +3228,6 @@ static void make_bfc_client (unsigned int addr, int port) {
   }
   if (0 == hostrequest) {
     sprintf(fd[sock].req_header, 
-            ftp ? 
-            "GET ftp://%s:%d/%12.10f/%d%s%s HTTP/1.0\r\n"
-            "%s"
-            "%s"
-            "%s"
-            "%s"
-            "\r\n" 
-            :
             "GET http://%s:%d/%12.10f/%d%s%s HTTP/1.0\r\n"
             "%s"
             "%s"
