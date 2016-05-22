@@ -2989,7 +2989,7 @@ static void follow_links(int sock) {
 }
 
 static int verify_content(int sock, char * buf, int done) {
-  if (urls_mode && !check_content)
+  if (urls_mode || !check_content)
     return 1;
   int l = fd[sock].response_length;
   char * d = response_buffer + (l % 256) + fd[sock].nalternate;
@@ -3144,7 +3144,7 @@ static int read_response(int sock) {
                       expected_length, cli, fd[sock].response_length);
             fd[sock].response_length = fd[sock].length = cli;
         }
-        if (fd[sock].req_header[9] == '2') {
+        if (fd[sock].req_header[9] == '2') { // ^200 OK
           if (!verify_content(sock,p,lbody)) {
             if (verbose || verbose_errors)
               printf("content verification error '%s'\n", fd[sock].base_url);
