@@ -4326,10 +4326,10 @@ static void ink_web_canonicalize_url(const char *base_url, const char *emb_url, 
                   
           remove_last_seg(base.path, temp);
           remove_multiple_slash(temp, temp2);
-                  
+
           /* append emb_path */
-                  
-          sprintf(temp2,"%s%s",temp2,emb.path);
+
+          strncat(temp2, emb.path, MAX_URL_LEN - strlen(temp2) - 1);
 
           /* remove "." and ".." */
                   
